@@ -8,7 +8,7 @@ import os
 import logging
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers
+from tensorflow import layers, models, optimizers
 
 logger = logging.getLogger(__name__)
 
