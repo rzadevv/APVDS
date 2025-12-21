@@ -1,205 +1,484 @@
 """
-Fusion Model using Gradient Boosting.
+Fusion Model (Meta-Learner) - ARES v2.0
 
-This module implements the fusion model that combines the outputs from the three
-analysis streams to make a final decision.
+Attention-based fusion of three analysis streams with 
+confidence calibration for improved deepfake detection.
 """
 
 import os
 import logging
+from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
 import pickle
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 
 logger = logging.getLogger(__name__)
 
+
+class StreamAttention(nn.Module):
+    """
+    Attention mechanism for weighting stream contributions.
+    
+    Learns to dynamically weight streams based on input quality
+    and reliability indicators.
+    """
+    
+    def __init__(self, num_streams: int = 3, feature_size: int = 8, hidden_size: int = 32):
+        super().__init__()
+        
+        # Each stream provides: score + confidence + additional features
+        self.stream_encoder = nn.Sequential(
+            nn.Linear(feature_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Query, Key, Value for self-attention
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        
+        # Output projection
+        self.output = nn.Linear(hidden_size * num_streams, hidden_size)
+    
+    def forward(self, stream_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute attention-weighted fusion.
+        
+        Args:
+            stream_features: [batch, num_streams, feature_size]
+            
+        Returns:
+            Tuple of (fused_features, attention_weights)
+        """
+        batch_size, num_streams, _ = stream_features.shape
+        
+        # Encode streams
+        encoded = self.stream_encoder(stream_features)  # [batch, streams, hidden]
+        
+        # Self-attention
+        Q = self.query(encoded)
+        K = self.key(encoded)
+        V = self.value(encoded)
+        
+        # Attention scores
+        scale = Q.shape[-1] ** 0.5
+        attn_scores = torch.bmm(Q, K.transpose(1, 2)) / scale  # [batch, streams, streams]
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        
+        # Weighted values
+        attended = torch.bmm(attn_weights, V)  # [batch, streams, hidden]
+        
+        # Flatten and project
+        flattened = attended.view(batch_size, -1)
+        output = self.output(flattened)
+        
+        # Return attention weights for streams (diagonal of attention matrix)
+        stream_weights = attn_weights.diagonal(dim1=1, dim2=2)  # [batch, streams]
+        
+        return output, stream_weights
+
+
+class FusionClassifier(nn.Module):
+    """
+    Final classification head with confidence estimation.
+    """
+    
+    def __init__(self, input_size: int = 32, hidden_size: int = 64):
+        super().__init__()
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Separate heads for classification and confidence
+        self.class_head = nn.Linear(hidden_size // 2, 1)
+        self.confidence_head = nn.Linear(hidden_size // 2, 1)
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Classify and estimate confidence.
+        
+        Args:
+            x: [batch, input_size]
+            
+        Returns:
+            Tuple of (class_logits, confidence_logits)
+        """
+        features = self.classifier(x)
+        class_logits = self.class_head(features)
+        confidence_logits = self.confidence_head(features)
+        
+        return class_logits, confidence_logits
+
+
 class FusionModel:
     """
-    Fusion model that combines the outputs from the three analysis streams.
+    Enhanced Fusion Model with attention-based stream aggregation
+    and confidence calibration.
     
-    This model uses a gradient boosting classifier to make the final decision
-    based on the probability scores and features from each analysis stream.
+    Combines outputs from:
+    - Stream A: Spectro-Temporal (Wav2Vec2)
+    - Stream B: Acoustic-Biometric (LSTM)
+    - Stream C: Linguistic-Prosodic (SLIM)
     """
     
-    def __init__(self, model_path=None):
+    def __init__(self, model_path: Optional[str] = None, config=None):
         """
         Initialize the fusion model.
         
         Args:
-            model_path: Path to a pre-trained model (optional)
+            model_path: Path to pre-trained weights
+            config: ARES configuration
         """
-        self.model = None
+        self.device = torch.device('cpu')
+        self.config = config
         
-        # Try to load a pre-trained model if provided
-        if model_path and os.path.exists(model_path):
-            self._load_model(model_path)
-        else:
-            # Create a new model
-            self._build_model()
-            
-        logger.info("FusionModel initialized")
-    
-    def _build_model(self):
-        """
-        Build the gradient boosting model.
-        """
-        logger.info("Building new FusionModel")
+        # Neural attention-based fusion
+        self.attention = StreamAttention(
+            num_streams=3,
+            feature_size=8,  # score + derived features
+            hidden_size=32
+        ).to(self.device)
         
-        # Create a gradient boosting classifier
-        self.model = GradientBoostingClassifier(
+        self.classifier = FusionClassifier(
+            input_size=32,
+            hidden_size=64
+        ).to(self.device)
+        
+        # Gradient Boosting as backup/ensemble
+        self.gb_model = GradientBoostingClassifier(
             n_estimators=100,
             learning_rate=0.1,
-            max_depth=3,
+            max_depth=4,
+            min_samples_split=5,
             random_state=42
         )
+        self.gb_trained = False
         
-        logger.info("Model built successfully")
+        # Calibration temperature
+        self.temperature = 1.0
+        
+        # Load weights
+        if model_path and os.path.exists(model_path):
+            self._load_model(model_path)
+        
+        self._set_eval_mode()
+        logger.info("FusionModel (Attention) initialized")
     
-    def _load_model(self, model_path):
+    def _set_eval_mode(self):
+        """Set neural modules to eval mode."""
+        self.attention.eval()
+        self.classifier.eval()
+    
+    def _load_model(self, model_path: str):
+        """Load pre-trained weights."""
+        try:
+            checkpoint = torch.load(model_path, map_location=self.device)
+            self.attention.load_state_dict(checkpoint['attention'])
+            self.classifier.load_state_dict(checkpoint['classifier'])
+            self.temperature = checkpoint.get('temperature', 1.0)
+            
+            if 'gb_model' in checkpoint:
+                self.gb_model = checkpoint['gb_model']
+                self.gb_trained = True
+            
+            logger.info(f"Loaded fusion model from: {model_path}")
+        except Exception as e:
+            logger.warning(f"Could not load model: {e}")
+    
+    def save_model(self, model_path: str):
+        """Save model weights."""
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        checkpoint = {
+            'attention': self.attention.state_dict(),
+            'classifier': self.classifier.state_dict(),
+            'temperature': self.temperature
+        }
+        if self.gb_trained:
+            checkpoint['gb_model'] = self.gb_model
+        
+        torch.save(checkpoint, model_path)
+        logger.info(f"Saved fusion model to: {model_path}")
+    
+    def prepare_features(self, stream_a_score: float, stream_b_score: float,
+                         stream_c_score: float, 
+                         stream_a_extra: Dict = None,
+                         stream_b_extra: Dict = None,
+                         stream_c_extra: Dict = None) -> torch.Tensor:
         """
-        Load a pre-trained model.
+        Prepare features for fusion from stream outputs.
         
         Args:
-            model_path: Path to the model file
+            stream_*_score: Score from each stream
+            stream_*_extra: Optional extra features from each stream
+            
+        Returns:
+            Feature tensor [1, 3, 8]
         """
-        try:
-            logger.info(f"Loading model from: {model_path}")
-            with open(model_path, 'rb') as f:
-                self.model = pickle.load(f)
-            logger.info("Model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
-            # Fall back to creating a new model
-            self._build_model()
+        # Build feature vector for each stream
+        def stream_features(score, extra=None):
+            feats = [
+                score,  # Primary score
+                abs(score - 0.5),  # Confidence (distance from uncertainty)
+                1.0 if score > 0.5 else 0.0,  # Binary prediction
+                min(score, 1 - score),  # Uncertainty
+            ]
+            
+            # Add extra features if available
+            if extra:
+                feats.append(extra.get('attention_std', 0.0))
+                feats.append(extra.get('quality_score', 0.5))
+            else:
+                feats.extend([0.0, 0.5])
+            
+            # Pad to 8 features
+            while len(feats) < 8:
+                feats.append(0.0)
+            
+            return feats[:8]
+        
+        stream_a = stream_features(stream_a_score, stream_a_extra)
+        stream_b = stream_features(stream_b_score, stream_b_extra)
+        stream_c = stream_features(stream_c_score, stream_c_extra)
+        
+        features = torch.tensor([stream_a, stream_b, stream_c]).float()
+        features = features.unsqueeze(0).to(self.device)  # [1, 3, 8]
+        
+        return features
     
-    def save_model(self, model_path):
+    def analyze(self, stream_a_score: float, stream_b_score: float, 
+                stream_c_score: float,
+                stream_a_extra: Dict = None,
+                stream_b_extra: Dict = None,
+                stream_c_extra: Dict = None) -> Dict[str, Any]:
         """
-        Save the model.
+        Fuse stream outputs and make final decision.
         
         Args:
-            model_path: Path to save the model
+            stream_*_score: Score from each stream (0-1)
+            stream_*_extra: Optional extra features
+            
+        Returns:
+            Dictionary with final score, decision factors, and stream weights
         """
-        if self.model is None:
-            logger.error("Cannot save model: No model exists")
-            return
+        logger.info("Running attention-based fusion")
+        
+        # Prepare features
+        features = self.prepare_features(
+            stream_a_score, stream_b_score, stream_c_score,
+            stream_a_extra, stream_b_extra, stream_c_extra
+        )
+        
+        with torch.no_grad():
+            # Attention-based fusion
+            fused, stream_weights = self.attention(features)
             
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            # Classification with confidence
+            class_logits, conf_logits = self.classifier(fused)
             
-            # Save the model
-            with open(model_path, 'wb') as f:
-                pickle.dump(self.model, f)
-            logger.info(f"Model saved to: {model_path}")
-        except Exception as e:
-            logger.error(f"Error saving model: {str(e)}")
+            # Temperature-scaled sigmoid
+            scaled_logits = class_logits / self.temperature
+            score = torch.sigmoid(scaled_logits).item()
+            confidence = torch.sigmoid(conf_logits).item()
+        
+        # Gradient Boosting ensemble (if trained)
+        if self.gb_trained:
+            gb_features = np.array([[stream_a_score, stream_b_score, stream_c_score]])
+            try:
+                gb_prob = self.gb_model.predict_proba(gb_features)[0][1]
+                # Ensemble: weighted average
+                score = 0.7 * score + 0.3 * gb_prob
+            except:
+                pass  # Use neural score only
+        
+        # Stream contribution analysis
+        weights = stream_weights.cpu().numpy().flatten()
+        stream_names = ['Spectro-Temporal (A)', 'Acoustic-Biometric (B)', 'Linguistic-Prosodic (C)']
+        scores = [stream_a_score, stream_b_score, stream_c_score]
+        
+        # Generate decision factors
+        decision_factors = self._generate_decision_factors(
+            scores, weights, stream_names, score
+        )
+        
+        return {
+            'score': float(score),
+            'confidence': float(confidence),
+            'stream_weights': {
+                'stream_a': float(weights[0]),
+                'stream_b': float(weights[1]),
+                'stream_c': float(weights[2])
+            },
+            'decision_factors': decision_factors
+        }
     
-    def train(self, X_train, y_train, X_val=None, y_val=None):
+    def _generate_decision_factors(self, scores: List[float], weights: np.ndarray,
+                                   names: List[str], final_score: float) -> List[str]:
+        """Generate human-readable decision factors."""
+        factors = []
+        
+        # Rank streams by contribution (score * weight)
+        contributions = [(n, s, w) for n, s, w in zip(names, scores, weights)]
+        contributions.sort(key=lambda x: abs(x[1] - 0.5) * x[2], reverse=True)
+        
+        for name, score, weight in contributions:
+            weight_pct = weight * 100
+            
+            if score > 0.7:
+                factors.append(f"{name} strongly indicates synthetic ({score:.0%}, weight: {weight_pct:.0f}%)")
+            elif score > 0.55:
+                factors.append(f"{name} suggests possible synthesis ({score:.0%}, weight: {weight_pct:.0f}%)")
+            elif score < 0.3:
+                factors.append(f"{name} strongly indicates authentic ({score:.0%}, weight: {weight_pct:.0f}%)")
+            elif score < 0.45:
+                factors.append(f"{name} suggests likely authentic ({score:.0%}, weight: {weight_pct:.0f}%)")
+            else:
+                factors.append(f"{name} inconclusive ({score:.0%}, weight: {weight_pct:.0f}%)")
+        
+        # Overall assessment
+        if final_score > 0.7:
+            factors.insert(0, "HIGH CONFIDENCE: Audio is likely AI-generated or cloned")
+        elif final_score > 0.5:
+            factors.insert(0, "MODERATE: Some synthetic characteristics detected")
+        elif final_score < 0.3:
+            factors.insert(0, "HIGH CONFIDENCE: Audio appears authentic")
+        else:
+            factors.insert(0, "LIKELY AUTHENTIC: Natural speech patterns detected")
+        
+        return factors
+    
+    def train(self, X_train: np.ndarray, y_train: np.ndarray,
+              X_val: np.ndarray = None, y_val: np.ndarray = None,
+              epochs: int = 50, lr: float = 1e-3) -> Dict[str, List[float]]:
         """
         Train the fusion model.
         
         Args:
-            X_train: Training features (scores from the three streams)
-            y_train: Training labels (1 for cloned, 0 for authentic)
-            X_val: Validation features (optional)
-            y_val: Validation labels (optional)
+            X_train: [N, 3] array of stream scores
+            y_train: [N] array of labels (0=authentic, 1=synthetic)
+            X_val: Optional validation features
+            y_val: Optional validation labels
+            epochs: Number of neural training epochs
+            lr: Learning rate
             
         Returns:
-            Training accuracy
+            Training history
         """
-        if self.model is None:
-            self._build_model()
-            
-        # Train the model
-        logger.info("Training fusion model")
-        self.model.fit(X_train, y_train)
+        from torch.optim import AdamW
         
-        # Evaluate on training set
-        train_accuracy = self.model.score(X_train, y_train)
-        logger.info(f"Training accuracy: {train_accuracy:.4f}")
+        logger.info("Training fusion model...")
         
-        # Evaluate on validation set if provided
+        # Train Gradient Boosting first
+        logger.info("Training Gradient Boosting ensemble...")
+        self.gb_model.fit(X_train, y_train)
+        self.gb_trained = True
+        
+        train_acc = self.gb_model.score(X_train, y_train)
+        logger.info(f"GB Train accuracy: {train_acc:.4f}")
+        
         if X_val is not None and y_val is not None:
-            val_accuracy = self.model.score(X_val, y_val)
-            logger.info(f"Validation accuracy: {val_accuracy:.4f}")
+            val_acc = self.gb_model.score(X_val, y_val)
+            logger.info(f"GB Val accuracy: {val_acc:.4f}")
         
-        return train_accuracy
-    
-    def prepare_features(self, stream_a_score, stream_b_score, stream_c_score):
-        """
-        Prepare features for the fusion model.
+        # Train neural attention model
+        logger.info("Training neural attention fusion...")
         
-        Args:
-            stream_a_score: Score from Stream A (Spectro-Temporal Analysis)
-            stream_b_score: Score from Stream B (Acoustic & Biometric Analysis)
-            stream_c_score: Score from Stream C (Linguistic & Prosodic Analysis)
+        self.attention.train()
+        self.classifier.train()
+        
+        params = list(self.attention.parameters()) + list(self.classifier.parameters())
+        optimizer = AdamW(params, lr=lr, weight_decay=0.01)
+        criterion = nn.BCEWithLogitsLoss()
+        
+        history = {'train_loss': [], 'val_loss': []}
+        
+        for epoch in range(epochs):
+            epoch_loss = 0.0
             
-        Returns:
-            Features array for the model
-        """
-        # Basic feature vector with just the scores
-        features = np.array([stream_a_score, stream_b_score, stream_c_score]).reshape(1, -1)
-        
-        # In a real implementation, we might add more derived features like:
-        # - Pairwise differences between scores
-        # - Statistical moments of the scores
-        # - Weighted combinations
-        
-        return features
-    
-    def analyze(self, stream_a_score, stream_b_score, stream_c_score):
-        """
-        Analyze the combined outputs from the three streams.
-        
-        Args:
-            stream_a_score: Score from Stream A (Spectro-Temporal Analysis)
-            stream_b_score: Score from Stream B (Acoustic & Biometric Analysis)
-            stream_c_score: Score from Stream C (Linguistic & Prosodic Analysis)
+            # Mini-batch training
+            batch_size = 32
+            indices = np.random.permutation(len(X_train))
             
-        Returns:
-            Dictionary with analysis results
-        """
-        logger.info("Running fusion analysis")
+            for i in range(0, len(X_train), batch_size):
+                batch_idx = indices[i:i+batch_size]
+                batch_X = X_train[batch_idx]
+                batch_y = y_train[batch_idx]
+                
+                optimizer.zero_grad()
+                
+                # Prepare features for batch
+                batch_features = []
+                for scores in batch_X:
+                    feat = self.prepare_features(scores[0], scores[1], scores[2])
+                    batch_features.append(feat)
+                
+                features = torch.cat(batch_features, dim=0)
+                labels = torch.tensor(batch_y, dtype=torch.float32).to(self.device)
+                
+                # Forward
+                fused, _ = self.attention(features)
+                class_logits, _ = self.classifier(fused)
+                
+                loss = criterion(class_logits.squeeze(), labels)
+                loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+            
+            avg_loss = epoch_loss / max(len(X_train) // batch_size, 1)
+            history['train_loss'].append(avg_loss)
+            
+            if epoch % 10 == 0:
+                logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
         
-        # For demonstration purposes, we'll return a weighted average
-        # In a real implementation, this would use the trained model
+        self._set_eval_mode()
         
-        # Prepare features
-        features = self.prepare_features(stream_a_score, stream_b_score, stream_c_score)
+        # Calibrate temperature using validation set
+        if X_val is not None and y_val is not None:
+            self._calibrate_temperature(X_val, y_val)
         
-        # If we have a trained model, use it
-        # if self.model is not None:
-        #     probability = self.model.predict_proba(features)[0][1]  # Probability of being cloned
-        # else:
-        #     # Fallback to weighted average if no model is available
+        logger.info("Fusion training complete")
+        return history
+    
+    def _calibrate_temperature(self, X_val: np.ndarray, y_val: np.ndarray):
+        """Calibrate temperature scaling for better confidence estimates."""
+        logger.info("Calibrating confidence temperature...")
         
-        # For demonstration, use a weighted average of the scores
-        # Stream A has the highest weight as spectral artifacts are most reliable
-        weights = [0.4, 0.3, 0.3]  # Weights for Stream A, B, C
-        scores = [stream_a_score, stream_b_score, stream_c_score]
-        weighted_score = np.average(scores, weights=weights)
+        # Grid search for best temperature
+        best_temp = 1.0
+        best_loss = float('inf')
         
-        # Determine which streams contributed most to the decision
-        stream_names = ['Spectro-Temporal', 'Acoustic-Biometric', 'Linguistic-Prosodic']
-        ranked_streams = sorted(
-            zip(stream_names, scores),
-            key=lambda x: abs(x[1] - 0.5),  # Sort by distance from neutral (0.5)
-            reverse=True
-        )
+        for temp in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]:
+            self.temperature = temp
+            
+            total_loss = 0.0
+            for scores, label in zip(X_val, y_val):
+                result = self.analyze(scores[0], scores[1], scores[2])
+                pred = result['score']
+                # Cross-entropy loss
+                loss = -label * np.log(pred + 1e-8) - (1-label) * np.log(1-pred + 1e-8)
+                total_loss += loss
+            
+            if total_loss < best_loss:
+                best_loss = total_loss
+                best_temp = temp
         
-        # Generate decision factors based on the scores
-        decision_factors = []
-        for stream, score in ranked_streams:
-            if score > 0.6:
-                decision_factors.append(f"{stream} analysis strongly indicates cloned voice")
-            elif score > 0.5:
-                decision_factors.append(f"{stream} analysis suggests possible cloning")
-            elif score < 0.4:
-                decision_factors.append(f"{stream} analysis strongly indicates authentic voice")
-            else:
-                decision_factors.append(f"{stream} analysis suggests likely authentic voice")
-        
-        return {
-            'score': float(weighted_score),
-            'decision_factors': decision_factors
-        } 
+        self.temperature = best_temp
+        logger.info(f"Calibrated temperature: {best_temp}")

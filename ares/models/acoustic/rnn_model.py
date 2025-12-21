@@ -1,270 +1,534 @@
 """
-Acoustic & Biometric Analysis Model.
+Acoustic & Biometric Analysis Model (Stream B) - ARES v2.0
 
-This module implements the RNN model for analyzing acoustic and biometric
-characteristics of speech.
+Enhanced RNN model with bidirectional LSTM, attention mechanism,
+and improved voice quality analysis for deepfake detection.
 """
 
 import os
 import logging
+from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+
+class BiometricAttention(nn.Module):
+    """
+    Self-attention module for acoustic feature sequences.
+    
+    Learns to focus on regions with unusual biometric characteristics.
+    """
+    
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply attention mechanism.
+        
+        Args:
+            x: [batch, seq_len, hidden_size]
+            mask: Optional attention mask
+            
+        Returns:
+            Tuple of (weighted_sum, attention_weights)
+        """
+        attn_scores = self.attention(x).squeeze(-1)  # [batch, seq_len]
+        
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
+        
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [batch, seq_len]
+        
+        # Weighted sum
+        weighted_sum = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # [batch, hidden]
+        
+        return weighted_sum, attn_weights
+
+
+class AcousticEncoder(nn.Module):
+    """
+    Encodes MFCC and pitch sequences using bidirectional LSTM.
+    """
+    
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 2, dropout: float = 0.3):
+        super().__init__()
+        
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        self.attention = BiometricAttention(hidden_size * 2)
+        self.norm = nn.LayerNorm(hidden_size * 2)
+    
+    def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode sequence with LSTM and attention.
+        
+        Args:
+            x: [batch, seq_len, input_size]
+            lengths: Optional sequence lengths for packing
+            
+        Returns:
+            Tuple of (encoded, attention_weights)
+        """
+        # LSTM encoding
+        outputs, _ = self.lstm(x)  # [batch, seq_len, hidden*2]
+        outputs = self.norm(outputs)
+        
+        # Attention pooling
+        encoded, attn_weights = self.attention(outputs)
+        
+        return encoded, attn_weights
+
+
+class VoiceQualityAnalyzer(nn.Module):
+    """
+    Analyzes voice quality metrics (jitter, shimmer, HNR, etc.)
+    
+    These metrics are strong indicators of synthetic vs natural speech.
+    """
+    
+    def __init__(self, num_features: int = 8, hidden_size: int = 64):
+        super().__init__()
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(num_features, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU()
+        )
+        
+        # Thresholds for voice quality metrics (learned)
+        self.threshold_net = nn.Linear(num_features, num_features)
+    
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Analyze voice quality features.
+        
+        Args:
+            features: [batch, num_features] - jitter, shimmer, etc.
+            
+        Returns:
+            Tuple of (encoded, anomaly_scores)
+        """
+        encoded = self.encoder(features)
+        
+        # Compute anomaly scores based on learned thresholds
+        thresholds = torch.sigmoid(self.threshold_net(features))
+        anomaly_scores = torch.abs(features - thresholds)
+        
+        return encoded, {'voice_quality_anomalies': anomaly_scores}
+
+
 class AcousticBiometricModel:
     """
-    RNN-based model for acoustic and biometric analysis.
+    Enhanced Acoustic & Biometric Analysis using bidirectional LSTM
+    with attention for deepfake detection.
     
-    This model analyzes acoustic features like MFCCs, pitch contour, jitter,
-    and shimmer to detect the subtle biometric signatures of human speech.
+    Analyzes:
+    - MFCC trajectories
+    - Pitch contour dynamics
+    - Voice quality metrics (jitter, shimmer)
+    - Formant transitions
     """
     
-    def __init__(self, model_path=None):
+    def __init__(self, model_path: Optional[str] = None, config=None):
         """
         Initialize the model.
         
         Args:
-            model_path: Path to a pre-trained model (optional)
+            model_path: Path to pre-trained weights
+            config: ARES configuration
         """
-        self.model = None
+        self.device = torch.device('cpu')
+        self.config = config
         
-        # Try to load a pre-trained model if provided
+        # Model hyperparameters
+        hidden_size = 256
+        if config:
+            hidden_size = config.model.acoustic_hidden_size
+        
+        # Build model components
+        self.mfcc_encoder = AcousticEncoder(
+            input_size=120,  # 40 MFCCs + delta + delta-delta = 120 features
+            hidden_size=hidden_size // 2,
+            num_layers=2,
+            dropout=0.3
+        ).to(self.device)
+        
+        self.pitch_encoder = AcousticEncoder(
+            input_size=3,  # f0, voiced_flag, voiced_prob
+            hidden_size=hidden_size // 4,
+            num_layers=1,
+            dropout=0.2
+        ).to(self.device)
+        
+        self.voice_quality = VoiceQualityAnalyzer(
+            num_features=8,  # jitter, shimmer, HNR, etc.
+            hidden_size=64
+        ).to(self.device)
+        
+        # Fusion and classification
+        fusion_input_size = hidden_size + hidden_size // 2 + 64
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_input_size, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        
+        # Load weights if available
         if model_path and os.path.exists(model_path):
             self._load_model(model_path)
-        else:
-            # Create a new model
-            self._build_model()
-            
-        logger.info("AcousticBiometricModel initialized")
+        
+        self._set_eval_mode()
+        logger.info("AcousticBiometricModel (Enhanced) initialized")
     
-    def _build_model(self):
-        """
-        Build the LSTM-based model architecture.
-        """
-        logger.info("Building new AcousticBiometricModel")
-        
-        # Define input shapes
-        # MFCC features (e.g., 13 base + 13 delta + 13 delta-delta features)
-        mfcc_input = layers.Input(shape=(None, 39), name='mfcc_features')
-        
-        # Pitch contour features (f0, voiced flag)
-        pitch_input = layers.Input(shape=(None, 2), name='pitch_features')
-        
-        # Global features (jitter, shimmer)
-        global_input = layers.Input(shape=(2,), name='global_features')
-        
-        # Process MFCC features with Bi-LSTM
-        x_mfcc = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(mfcc_input)
-        x_mfcc = layers.Bidirectional(layers.LSTM(64))(x_mfcc)
-        
-        # Process pitch contour with Bi-LSTM
-        x_pitch = layers.Bidirectional(layers.LSTM(64, return_sequences=True))(pitch_input)
-        x_pitch = layers.Bidirectional(layers.LSTM(32))(x_pitch)
-        
-        # Combine sequential features
-        combined_sequential = layers.concatenate([x_mfcc, x_pitch])
-        
-        # Process combined sequential features
-        x = layers.Dense(128, activation='relu')(combined_sequential)
-        x = layers.Dropout(0.3)(x)
-        
-        # Add global features (jitter, shimmer)
-        global_features = layers.Dense(16, activation='relu')(global_input)
-        x = layers.concatenate([x, global_features])
-        
-        # Final dense layers
-        x = layers.Dense(64, activation='relu')(x)
-        x = layers.Dropout(0.2)(x)
-        
-        # Output layer
-        output = layers.Dense(1, activation='sigmoid', name='output')(x)
-        
-        # Create model
-        self.model = models.Model(
-            inputs=[mfcc_input, pitch_input, global_input],
-            outputs=output
-        )
-        
-        # Compile model
-        self.model.compile(
-            optimizer=optimizers.Adam(learning_rate=0.001),
-            loss='binary_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        logger.info("Model built successfully")
+    def _set_eval_mode(self):
+        """Set all modules to eval mode."""
+        self.mfcc_encoder.eval()
+        self.pitch_encoder.eval()
+        self.voice_quality.eval()
+        self.classifier.eval()
     
-    def _load_model(self, model_path):
-        """
-        Load a pre-trained model.
-        
-        Args:
-            model_path: Path to the model file
-        """
+    def _set_train_mode(self):
+        """Set all modules to train mode."""
+        self.mfcc_encoder.train()
+        self.pitch_encoder.train()
+        self.voice_quality.train()
+        self.classifier.train()
+    
+    def _load_model(self, model_path: str):
+        """Load pre-trained weights."""
         try:
-            logger.info(f"Loading model from: {model_path}")
-            self.model = models.load_model(model_path)
-            logger.info("Model loaded successfully")
+            checkpoint = torch.load(model_path, map_location=self.device)
+            self.mfcc_encoder.load_state_dict(checkpoint['mfcc_encoder'])
+            self.pitch_encoder.load_state_dict(checkpoint['pitch_encoder'])
+            self.voice_quality.load_state_dict(checkpoint['voice_quality'])
+            self.classifier.load_state_dict(checkpoint['classifier'])
+            logger.info(f"Loaded model from: {model_path}")
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
-            # Fall back to creating a new model
-            self._build_model()
+            logger.warning(f"Could not load model: {e}")
     
-    def preprocess_input(self, features):
+    def save_model(self, model_path: str):
+        """Save model weights."""
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        checkpoint = {
+            'mfcc_encoder': self.mfcc_encoder.state_dict(),
+            'pitch_encoder': self.pitch_encoder.state_dict(),
+            'voice_quality': self.voice_quality.state_dict(),
+            'classifier': self.classifier.state_dict()
+        }
+        torch.save(checkpoint, model_path)
+        logger.info(f"Saved model to: {model_path}")
+    
+    def _prepare_features(self, features: Dict) -> Dict[str, torch.Tensor]:
         """
-        Preprocess the input data for the model.
+        Prepare input features for the model.
         
         Args:
-            features: Dictionary with keys 'mfccs', 'pitch_contour', 'jitter', 'shimmer'
+            features: Dictionary with mfccs, pitch_contour, jitter, shimmer
             
         Returns:
-            Preprocessed inputs
+            Dictionary of tensors
         """
-        # Extract and prepare MFCCs
+        # MFCCs: [features, time] -> [batch, time, features]
         mfccs = features['mfccs']
-        if len(mfccs.shape) == 2:  # (features, frames)
-            mfccs = mfccs.T  # Convert to (frames, features)
-            
-        # Normalize MFCCs
-        mfccs_mean = np.mean(mfccs, axis=0)
-        mfccs_std = np.std(mfccs, axis=0) + 1e-8
-        mfccs_normalized = (mfccs - mfccs_mean) / mfccs_std
+        if isinstance(mfccs, np.ndarray):
+            if len(mfccs.shape) == 2:
+                mfccs = mfccs.T  # [time, features]
+            mfccs = torch.from_numpy(mfccs).float().unsqueeze(0)
         
-        # Extract and prepare pitch contour
-        f0 = features['pitch_contour']['f0']
-        voiced_flag = features['pitch_contour']['voiced_flag'].astype(float)
+        # Normalize MFCCs
+        mfccs = (mfccs - mfccs.mean(dim=1, keepdim=True)) / (mfccs.std(dim=1, keepdim=True) + 1e-8)
+        
+        # Pitch contour
+        pitch_data = features['pitch_contour']
+        if isinstance(pitch_data, dict):
+            f0 = pitch_data.get('f0', np.zeros(100))
+            voiced = pitch_data.get('voiced_flag', np.ones(100)).astype(float)
+            voiced_prob = pitch_data.get('voiced_probs', voiced)
+        else:
+            f0 = pitch_data
+            voiced = np.ones_like(f0)
+            voiced_prob = voiced
+        
+        # Handle NaN in f0
+        f0 = np.nan_to_num(f0, nan=0.0)
+        voiced_prob = np.nan_to_num(voiced_prob, nan=0.0)
         
         # Normalize f0
-        f0_mean = np.mean(f0[voiced_flag > 0])
-        f0_std = np.std(f0[voiced_flag > 0]) + 1e-8
-        f0_normalized = (f0 - f0_mean) / f0_std
-        f0_normalized[voiced_flag == 0] = 0  # Zero out unvoiced frames
+        f0_voiced = f0[voiced > 0.5]
+        if len(f0_voiced) > 0:
+            f0_mean = np.mean(f0_voiced)
+            f0_std = np.std(f0_voiced) + 1e-8
+            f0_norm = (f0 - f0_mean) / f0_std
+            f0_norm[voiced < 0.5] = 0
+        else:
+            f0_norm = np.zeros_like(f0)
         
-        # Combine pitch features
-        pitch_features = np.stack([f0_normalized, voiced_flag], axis=-1)
+        pitch_features = np.stack([f0_norm, voiced, voiced_prob], axis=-1)
+        pitch_tensor = torch.from_numpy(pitch_features).float().unsqueeze(0)
         
-        # Global features
-        global_features = np.array([features['jitter'], features['shimmer']])
+        # Voice quality features
+        jitter = features.get('jitter', 0.0)
+        shimmer = features.get('shimmer', 0.0)
         
-        # Add batch dimension
-        mfccs_normalized = np.expand_dims(mfccs_normalized, axis=0)
-        pitch_features = np.expand_dims(pitch_features, axis=0)
-        global_features = np.expand_dims(global_features, axis=0)
+        # Typical ranges for additional derived features
+        jitter_score = min(jitter / 0.02, 1.0)  # Normalize to 0-1
+        shimmer_score = min(shimmer / 0.1, 1.0)
+        
+        # Derive additional voice quality metrics from pitch
+        if len(f0_voiced) > 1:
+            f0_cv = np.std(f0_voiced) / (np.mean(f0_voiced) + 1e-8)  # Coefficient of variation
+            f0_range = (np.max(f0_voiced) - np.min(f0_voiced)) / (np.mean(f0_voiced) + 1e-8)
+        else:
+            f0_cv = 0.0
+            f0_range = 0.0
+        
+        voice_quality_features = torch.tensor([
+            jitter, shimmer, jitter_score, shimmer_score,
+            f0_cv, f0_range, np.mean(voiced), np.std(f0_norm)
+        ]).float().unsqueeze(0)
         
         return {
-            'mfcc_features': mfccs_normalized,
-            'pitch_features': pitch_features,
-            'global_features': global_features
+            'mfccs': mfccs.to(self.device),
+            'pitch': pitch_tensor.to(self.device),
+            'voice_quality': voice_quality_features.to(self.device)
         }
     
-    def train(self, train_data, validation_data=None, epochs=20, batch_size=32):
+    def analyze(self, features: Dict) -> Dict[str, Any]:
         """
-        Train the model.
+        Analyze acoustic and biometric characteristics.
         
         Args:
-            train_data: Training data dictionary with mfcc, pitch, global features and labels
-            validation_data: Validation data with the same format (optional)
-            epochs: Number of epochs to train
+            features: Dictionary with mfccs, pitch_contour, jitter, shimmer
+            
+        Returns:
+            Dictionary with score and findings
+        """
+        logger.info("Analyzing acoustic and biometric features")
+        
+        try:
+            # Prepare inputs
+            inputs = self._prepare_features(features)
+            
+            with torch.no_grad():
+                # Encode MFCC sequence
+                mfcc_encoded, mfcc_attn = self.mfcc_encoder(inputs['mfccs'])
+                
+                # Encode pitch sequence
+                pitch_encoded, pitch_attn = self.pitch_encoder(inputs['pitch'])
+                
+                # Analyze voice quality
+                vq_encoded, vq_anomalies = self.voice_quality(inputs['voice_quality'])
+                
+                # Concatenate all features
+                combined = torch.cat([mfcc_encoded, pitch_encoded, vq_encoded], dim=-1)
+                
+                # Classification
+                logits = self.classifier(combined)
+                score = torch.sigmoid(logits).item()
+            
+            # Generate findings
+            findings = self._generate_findings(
+                score, 
+                features.get('jitter', 0), 
+                features.get('shimmer', 0),
+                vq_anomalies,
+                mfcc_attn.cpu().numpy(),
+                pitch_attn.cpu().numpy()
+            )
+            
+            return {
+                'score': float(score),
+                'findings': findings,
+                'mfcc_attention': mfcc_attn.cpu().numpy().tolist(),
+                'pitch_attention': pitch_attn.cpu().numpy().tolist()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in acoustic analysis: {e}")
+            # Fallback to heuristic analysis
+            return self._heuristic_analysis(features)
+    
+    def _heuristic_analysis(self, features: Dict) -> Dict[str, Any]:
+        """Fallback heuristic analysis without model inference."""
+        jitter = features.get('jitter', 0.01)
+        shimmer = features.get('shimmer', 0.03)
+        
+        # Heuristic scoring based on voice quality metrics
+        # Very low jitter/shimmer can indicate synthetic audio
+        jitter_suspicious = jitter < 0.003 or jitter > 0.05
+        shimmer_suspicious = shimmer < 0.01 or shimmer > 0.15
+        
+        score = 0.5
+        findings = []
+        
+        if jitter_suspicious:
+            score += 0.15
+            if jitter < 0.003:
+                findings.append(f"Abnormally low jitter ({jitter:.6f}) - possible synthesis")
+            else:
+                findings.append(f"Elevated jitter ({jitter:.6f}) - unusual voice quality")
+        
+        if shimmer_suspicious:
+            score += 0.15
+            if shimmer < 0.01:
+                findings.append(f"Abnormally low shimmer ({shimmer:.6f}) - possible synthesis")
+            else:
+                findings.append(f"Elevated shimmer ({shimmer:.6f}) - unusual voice quality")
+        
+        if not findings:
+            findings.append(f"Normal jitter ({jitter:.6f}) and shimmer ({shimmer:.6f})")
+            findings.append("Voice quality metrics consistent with natural speech")
+        
+        return {'score': min(score, 1.0), 'findings': findings}
+    
+    def _generate_findings(self, score: float, jitter: float, shimmer: float,
+                          vq_anomalies: Dict, mfcc_attn: np.ndarray, 
+                          pitch_attn: np.ndarray) -> List[str]:
+        """Generate human-readable findings from analysis."""
+        findings = []
+        
+        # Score-based findings
+        if score > 0.7:
+            findings.append("Strong acoustic anomalies detected - likely synthetic")
+        elif score > 0.5:
+            findings.append("Moderate acoustic irregularities observed")
+        else:
+            findings.append("Acoustic features consistent with natural speech")
+        
+        # Jitter/Shimmer analysis
+        # Natural speech: jitter ~0.5-1%, shimmer ~3-5%
+        if jitter < 0.003:
+            findings.append(f"Jitter ({jitter:.4%}) abnormally low - synthetic indicator")
+        elif jitter > 0.02:
+            findings.append(f"Jitter ({jitter:.4%}) elevated - potential voice disorder or synthesis artifact")
+        else:
+            findings.append(f"Jitter ({jitter:.4%}) within normal range")
+        
+        if shimmer < 0.015:
+            findings.append(f"Shimmer ({shimmer:.4%}) abnormally low - synthetic indicator")
+        elif shimmer > 0.1:
+            findings.append(f"Shimmer ({shimmer:.4%}) elevated - unusual amplitude variation")
+        else:
+            findings.append(f"Shimmer ({shimmer:.4%}) within normal range")
+        
+        # Attention-based findings
+        mfcc_attn_flat = mfcc_attn.flatten() if len(mfcc_attn.shape) > 1 else mfcc_attn
+        if len(mfcc_attn_flat) > 0 and np.std(mfcc_attn_flat) > 0.1:
+            peak_region = np.argmax(mfcc_attn_flat) / len(mfcc_attn_flat) * 100
+            findings.append(f"High attention at ~{peak_region:.0f}% of audio in MFCC analysis")
+        
+        return findings
+    
+    def train(self, train_data: Dict, validation_data: Optional[Dict] = None,
+              epochs: int = 30, batch_size: int = 16, lr: float = 1e-4):
+        """
+        Train the model on labeled data.
+        
+        Args:
+            train_data: Dict with features and labels
+            validation_data: Optional validation data
+            epochs: Number of epochs
             batch_size: Batch size
+            lr: Learning rate
             
         Returns:
             Training history
         """
-        if self.model is None:
-            self._build_model()
-            
-        # Prepare callbacks
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3)
-        ]
+        from torch.optim import AdamW
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
         
-        # Train model
-        logger.info(f"Starting training for {epochs} epochs")
-        history = self.model.fit(
-            [
-                train_data['mfcc_features'],
-                train_data['pitch_features'],
-                train_data['global_features']
-            ],
-            train_data['labels'],
-            batch_size=batch_size,
-            epochs=epochs,
-            validation_data=validation_data,
-            callbacks=callbacks
+        self._set_train_mode()
+        
+        # Collect all parameters
+        params = (
+            list(self.mfcc_encoder.parameters()) +
+            list(self.pitch_encoder.parameters()) +
+            list(self.voice_quality.parameters()) +
+            list(self.classifier.parameters())
         )
         
-        logger.info("Training completed")
+        optimizer = AdamW(params, lr=lr, weight_decay=0.01)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10)
+        criterion = nn.BCEWithLogitsLoss()
+        
+        history = {'train_loss': [], 'val_loss': []}
+        best_loss = float('inf')
+        
+        logger.info(f"Starting training for {epochs} epochs")
+        
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            for i in range(0, len(train_data['features']), batch_size):
+                batch_features = train_data['features'][i:i+batch_size]
+                batch_labels = train_data['labels'][i:i+batch_size]
+                
+                optimizer.zero_grad()
+                
+                batch_loss = 0.0
+                for feat, label in zip(batch_features, batch_labels):
+                    inputs = self._prepare_features(feat)
+                    
+                    mfcc_enc, _ = self.mfcc_encoder(inputs['mfccs'])
+                    pitch_enc, _ = self.pitch_encoder(inputs['pitch'])
+                    vq_enc, _ = self.voice_quality(inputs['voice_quality'])
+                    
+                    combined = torch.cat([mfcc_enc, pitch_enc, vq_enc], dim=-1)
+                    logits = self.classifier(combined)
+                    
+                    target = torch.tensor([[label]], dtype=torch.float32).to(self.device)
+                    batch_loss += criterion(logits, target)
+                
+                batch_loss /= len(batch_features)
+                batch_loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                optimizer.step()
+                
+                epoch_loss += batch_loss.item()
+                num_batches += 1
+            
+            avg_loss = epoch_loss / max(num_batches, 1)
+            history['train_loss'].append(avg_loss)
+            
+            scheduler.step()
+            
+            if epoch % 5 == 0:
+                logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
+            
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+        
+        self._set_eval_mode()
+        logger.info("Training complete")
+        
         return history
-    
-    def save_model(self, model_path):
-        """
-        Save the model.
-        
-        Args:
-            model_path: Path to save the model
-        """
-        if self.model is None:
-            logger.error("Cannot save model: No model exists")
-            return
-            
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
-            
-            # Save the model
-            self.model.save(model_path)
-            logger.info(f"Model saved to: {model_path}")
-        except Exception as e:
-            logger.error(f"Error saving model: {str(e)}")
-    
-    def analyze(self, features):
-        """
-        Analyze the acoustic and biometric characteristics of an audio sample.
-        
-        Args:
-            features: Dictionary with 'mfccs', 'pitch_contour', 'jitter', 'shimmer'
-            
-        Returns:
-            Dictionary with analysis results
-        """
-        logger.info("Analyzing acoustic and biometric features")
-        
-        # For demonstration purposes, we'll return random scores
-        # In a real implementation, this would use the trained model
-        
-        # Placeholder for actual model prediction
-        # processed_input = self.preprocess_input(features)
-        # prediction = self.model.predict([
-        #     processed_input['mfcc_features'],
-        #     processed_input['pitch_features'],
-        #     processed_input['global_features']
-        # ])
-        # score = prediction[0][0]
-        
-        # For demonstration, return a random score between 0.0 and 1.0
-        # 0.0 = completely authentic, 1.0 = definitely cloned
-        score = np.random.uniform(0.3, 0.7)
-        
-        # Get jitter and shimmer values for the report
-        jitter = features['jitter']
-        shimmer = features['shimmer']
-        
-        # Generate some example findings based on the score and values
-        findings = []
-        if score > 0.7:
-            findings.append(f"Abnormally low jitter ({jitter:.6f}) and shimmer ({shimmer:.6f})")
-            findings.append("Unnatural pitch transitions detected")
-        elif score > 0.5:
-            findings.append(f"Somewhat unusual jitter ({jitter:.6f}) and shimmer ({shimmer:.6f}) values")
-            findings.append("Some irregularities in acoustic features")
-        else:
-            findings.append(f"Natural jitter ({jitter:.6f}) and shimmer ({shimmer:.6f}) values")
-            findings.append("Biometric features consistent with human voice")
-        
-        return {
-            'score': float(score),
-            'findings': findings
-        } 
